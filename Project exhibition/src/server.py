@@ -1,128 +1,156 @@
-# server.py - serves static UI, REST endpoints for status/logs/enroll/verify, and runs background loops.
-import uvicorn
-from fastapi import FastAPI, Request, UploadFile, File, Form
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from threading import Thread
-import time, json, os
+# Project exhibition/src/server.py
+import json
+import time
 from pathlib import Path
+from threading import Thread
+from typing import List, Optional
+
+from fastapi import FastAPI, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+from config import (
+    LOG_PATH, EVENTS_PATH, MODEL_PATH,
+    ROLLING_WINDOW, SOFT_ANOMALY_THRESHOLD, HARD_ANOMALY_THRESHOLD
+)
 from features import load_logs, aggregate_window
-from model import train_and_save, load_model
+from model import load_model, build_pipeline  # your file provides these
 from utils import append_event
-from detector import evaluate_once, state, handle_verification_result
-from config import LOG_PATH, MODEL_PATH
 
-app = FastAPI()
-# serve static UI folder
-static_dir = Path(__file__).resolve().parent.parent / "static"
-# app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+# --------- FastAPI app ----------
+app = FastAPI(title="AI User Threat Detection API")
 
-# Serve main page
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return FileResponse(Path(__file__).parent.parent / "UI" / "index2.html")
+# CORS: allow Vite dev (5173) and your Express server (5173/5174)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:5174", "http://127.0.0.1:5174"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
-# Endpoint: status (last score, last_status)
-@app.get("/api/status")
-def api_status():
-    return JSONResponse(state)
+# --------- In-memory detector state ----------
+state = {
+    "last_score": None,
+    "last_status": "init",
+    "last_event": None,
+    "model_loaded": False,
+}
 
-# Endpoint: recent logs (last N)
-@app.get("/api/logs")
-def api_logs(n: int = 40):
-    df = load_logs(limit=n)
-    return JSONResponse(json.loads(df.to_json(orient="records", date_format="iso")) if not df.empty else [])
+def score_once():
+    """Compute one anomaly score from latest window and update state."""
+    try:
+        df = load_logs()
+        X = aggregate_window(df, window=ROLLING_WINDOW)
+        if X is None:
+            state["last_status"] = "waiting_for_data"
+            return None
 
-# Endpoint: recent events
-@app.get("/api/events")
-def api_events():
-    p = Path("data/events.jsonl")
-    if not p.exists():
-        return JSONResponse([])
-    rows = []
-    with open(p, "r", encoding="utf-8") as f:
-        for L in f:
-            try:
-                rows.append(json.loads(L))
-            except:
-                pass
-    return JSONResponse(rows[-200:])
-
-# Endpoint: train model (trains from current logs)
-@app.post("/api/train")
-def api_train():
-    df = load_logs(limit=2000)
-    if df.empty:
-        return JSONResponse({"ok": False, "msg": "No logs to train from."})
-    # build feature dataset: compute rolling aggregates across the log and train on those
-    from features import aggregate_window
-    Xs = []
-    for i in range(6, min(len(df), 500)):
-        window = aggregate_window(df.iloc[:i], window=6)
-        if window is not None:
-            Xs.append(window.iloc[0].to_dict())
-    import pandas as pd
-    Xdf = pd.DataFrame(Xs)
-    model = train_and_save(Xdf)
-    return JSONResponse({"ok": True, "msg": "Model trained."})
-
-# Typing enrollment: client posts samples (list of timings arrays)
-@app.post("/api/enroll")
-async def api_enroll(payload: dict):
-    # payload: {"samples": [[t1,t2,...], ...], "sentence": "..." }
-    Path("data").mkdir(parents=True, exist_ok=True)
-    with open(Path("data")/"typing_profile.json", "w", encoding="utf-8") as f:
-        json.dump(payload, f)
-    append_event({"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), "type":"enroll"})
-    return JSONResponse({"ok": True})
-
-# Verification: client posts a timing sample (single)
-@app.post("/api/verify")
-async def api_verify(payload: dict):
-    # payload: {"timings": [...], "sentence": "..."}
-    p = Path("data/typing_profile.json")
-    if not p.exists():
-        return JSONResponse({"ok": False, "msg": "No typing profile enrolled."})
-    with open(p, "r", encoding="utf-8") as f:
-        prof = json.load(f)
-    ref_med = prof.get("samples_median")
-    # Accept older format
-    if ref_med is None:
-        ref_med = prof.get("samples")
-    candidate = payload.get("timings", [])
-    # simple distance with padding
-    import math
-    L = max(len(ref_med), len(candidate))
-    def pad(v):
-        if len(v) < L and len(v) > 0:
-            v = v + [sum(v)/len(v)]*(L-len(v))
-        return v[:L]
-    a = pad(candidate)
-    b = pad(ref_med)
-    dist = math.sqrt(sum((ai-bi)**2 for ai,bi in zip(a,b))) if len(a)>0 else float('inf')
-    # tolerance: relative to median speed
-    tol = (sum(abs(x) for x in b)/len(b))*0.7 + 0.05
-    ok = dist < tol
-    handle_verification_result(ok)
-    append_event({"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), "type":"verify", "ok": ok, "dist": dist, "tol": tol})
-    return JSONResponse({"ok": bool(ok), "dist": dist, "tol": tol})
-
-# Background loop to periodically evaluate behaviour
-def background_detector_loop():
-    print("[server] background detector loop started")
-    while True:
+        # load model if available; if not, build a fresh pipeline to avoid crashes
         try:
-            ev = evaluate_once()
-            # we just update state; UI will poll /api/status
-        except Exception as e:
-            append_event({"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), "type":"error", "msg": str(e)})
-        time.sleep(5)
+            model = load_model()
+            state["model_loaded"] = True
+        except Exception:
+            model = build_pipeline()  # untrained; decision_function will be meaningless
+            state["model_loaded"] = False
+
+        # decision_function: higher => more normal (your config is tuned to that)
+        # To avoid importing an extra score_window, call the pipeline directly
+        score = float(model.decision_function(X.values.astype(float))[0])
+        state["last_score"] = score
+
+        if score <= HARD_ANOMALY_THRESHOLD:
+            status = "hard_anomaly"
+        elif score <= SOFT_ANOMALY_THRESHOLD:
+            status = "soft_anomaly"
+        else:
+            status = "normal"
+
+        state["last_status"] = status
+        ev = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+              "type": "status",
+              "score": score,
+              "status": status}
+        state["last_event"] = ev
+        append_event(ev)
+        return ev
+    except Exception as e:
+        state["last_status"] = f"error: {e}"
+        append_event({"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                      "type": "error", "msg": str(e)})
+        return None
+
+def background_loop():
+    while True:
+        score_once()
+        time.sleep(5)  # poll every 5s
 
 @app.on_event("startup")
-def startup_event():
-    # start detector background thread
-    t = Thread(target=background_detector_loop, daemon=True)
-    t.start()
+def on_startup():
+    Thread(target=background_loop, daemon=True).start()
 
-if __name__ == "__main__":
-    uvicorn.run("server:app", host="127.0.0.1", port=8000, reload=False)
+# --------- Models for POST bodies ----------
+class VerifyBody(BaseModel):
+    ok: Optional[bool] = None
+    # (extend here if you later pass typing timings)
+
+class EnrollBody(BaseModel):
+    samples: List[List[float]] = []
+    sentence: Optional[str] = ""
+
+# --------- API ---------
+@app.get("/api/status")
+def api_status():
+    return JSONResponse({
+        "last_score": state["last_score"],
+        "last_status": state["last_status"],
+        "model_loaded": state["model_loaded"]
+    })
+
+@app.get("/api/logs")
+def api_logs(n: int = 100):
+    p = Path(LOG_PATH)
+    rows = []
+    if p.exists():
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rows.append(json.loads(line))
+                except:
+                    pass
+    return JSONResponse(rows[-n:])
+
+@app.get("/api/events")
+def api_events(n: int = 200):
+    p = Path(EVENTS_PATH)
+    rows = []
+    if p.exists():
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rows.append(json.loads(line))
+                except:
+                    pass
+    return JSONResponse(rows[-n:])
+
+@app.post("/api/verify")
+def api_verify(body: VerifyBody):
+    # Minimal: log verifier decision. (Later you can implement typing biometrics.)
+    ok = bool(body.ok)
+    ev = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+          "type": "verification", "result": ok}
+    append_event(ev)
+    if ok:
+        state["last_status"] = "normal"
+    return JSONResponse({"ok": True})
+
+@app.post("/api/enroll")
+def api_enroll(body: EnrollBody):
+    # just persist payload; your later typing code can use it
+    Path("data").mkdir(parents=True, exist_ok=True)
+    Path("data/typing_profile.json").write_text(json.dumps(body.dict()), encoding="utf-8")
+    append_event({"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"), "type": "enroll"})
+    return JSONResponse({"ok": True})
+
+# Run: uvicorn server:app --reload
