@@ -1,6 +1,6 @@
 # Configuration - tune thresholds, paths, and policy here.
 
-LOG_PATH = "data/logs.jsonl"
+LOG_PATH = "data/synthetic_logs.jsonl"
 MODEL_PATH = "data/model.joblib"
 TYPING_PROFILE_PATH = "data/typing_profile.json"
 EVENTS_PATH = "data/events.jsonl"
